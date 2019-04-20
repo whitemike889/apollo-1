@@ -226,8 +226,8 @@ bool FusionCameraDetectionComponent::Init() {
 
   CHECK(visualize_.Init_all_info_single_camera(
       visual_camera_, intrinsic_map_, extrinsic_map_, ex_lidar2imu,
-      pitch_adj_degree, yaw_adj_degree, roll_adj_degree,
-      image_height_, image_width_));
+      pitch_adj_degree, yaw_adj_degree, roll_adj_degree, image_height_,
+      image_width_));
 
   homography_im2car_ = visualize_.homography_im2car();
   camera_obstacle_pipeline_->SetIm2CarHomography(homography_im2car_);

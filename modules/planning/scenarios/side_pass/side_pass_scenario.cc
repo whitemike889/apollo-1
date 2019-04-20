@@ -1,4 +1,3 @@
-
 /******************************************************************************
  * Copyright 2018 The Apollo Authors. All Rights Reserved.
  *
@@ -35,6 +34,7 @@
 #include "modules/planning/scenarios/side_pass/stage_detect_safety.h"
 #include "modules/planning/scenarios/side_pass/stage_generate_path.h"
 #include "modules/planning/scenarios/side_pass/stage_pass_obstacle.h"
+#include "modules/planning/scenarios/side_pass/stage_side_pass.h"
 #include "modules/planning/scenarios/side_pass/stage_stop_on_wait_point.h"
 
 namespace apollo {
@@ -50,9 +50,16 @@ apollo::common::util::Factory<
 // The clearance distance from intersection/destination.
 // If ADC is too close, then do not enter SIDE_PASS.
 constexpr double kClearDistance = 15.0;
+constexpr double kSidePassMaxSpeed = 5.0;  // (10mph)
+constexpr double kSidePassMaxDistance = 10.0;
 
 void SidePassScenario::RegisterStages() {
   s_stage_factory_.Clear();
+  s_stage_factory_.Register(
+      ScenarioConfig::SIDE_PASS_DEFAULT_STAGE,
+      [](const ScenarioConfig::StageConfig& config) -> Stage* {
+        return new StageSidePass(config);
+      });
   s_stage_factory_.Register(
       ScenarioConfig::SIDE_PASS_APPROACH_OBSTACLE,
       [](const ScenarioConfig::StageConfig& config) -> Stage* {
@@ -121,6 +128,10 @@ bool SidePassScenario::IsTransferable(const Frame& frame,
     return false;
   }
 
+  if (config.stage_type(0) == ScenarioConfig::SIDE_PASS_DEFAULT_STAGE) {
+    return IsUnifiedTransferable(frame, config, current_scenario);
+  }
+
   std::string front_blocking_obstacle_id = PlanningContext::Planningstatus()
                                                .side_pass()
                                                .front_blocking_obstacle_id();
@@ -169,10 +180,82 @@ bool SidePassScenario::IsTransferable(const Frame& frame,
   }
 }
 
+bool SidePassScenario::IsUnifiedTransferable(const Frame& frame,
+                                             const ScenarioConfig& config,
+                                             const Scenario& current_scenario) {
+  if (current_scenario.scenario_type() == ScenarioConfig::SIDE_PASS) {
+    // Check side-pass exiting conditions.
+    // ADEBUG << "Checking if it's needed to exit SIDE_PASS:";
+    // ADEBUG << "Able to use self-lane counter = "
+    //        << PlanningContext::able_to_use_self_lane_counter();
+    // return PlanningContext::able_to_use_self_lane_counter() < 3;
+    return true;
+  } else if (current_scenario.scenario_type() != ScenarioConfig::LANE_FOLLOW) {
+    // If in some other scenario, then don't try to switch to SIDE_PASS.
+    ADEBUG << "Currently in some other scenario.";
+    return false;
+  } else {
+    // If originally in LANE_FOLLOW, then decide whether we should
+    // switch to SIDE_PASS scenario.
+    ADEBUG << "Checking if it's needed to switch from LANE_FOLLOW to "
+              "SIDE_PASS: ";
+    bool is_side_pass = IsUnifiedSidePassScenario(frame, config);
+    if (is_side_pass) {
+      ADEBUG << "   YES!";
+    } else {
+      ADEBUG << "   NO!";
+    }
+    return is_side_pass &&
+           PlanningContext::front_static_obstacle_cycle_counter() >= 1;
+  }
+}
+
 bool SidePassScenario::IsSidePassScenario(const Frame& frame,
                                           const ScenarioConfig& config) {
   return (IsFarFromDestination(frame) && IsFarFromIntersection(frame) &&
           HasBlockingObstacle(frame, config));
+}
+
+bool SidePassScenario::IsUnifiedSidePassScenario(const Frame& frame,
+                                                 const ScenarioConfig& config) {
+  return HasSingleReferenceLine(frame) && IsFarFromDestination(frame) &&
+         IsBlockingObstacleWithinDestination(frame) &&
+         IsFarFromIntersection(frame) && IsWithinSidePassingSpeedADC(frame) &&
+         IsSidePassableObstacle(
+             frame, frame.reference_line_info().front(),
+             frame.reference_line_info().front().GetBlockingObstacleId());
+}
+
+bool SidePassScenario::HasSingleReferenceLine(const Frame& frame) {
+  return frame.reference_line_info().size() <= 1;
+}
+
+bool SidePassScenario::IsBlockingObstacleWithinDestination(const Frame& frame) {
+  const auto& reference_line_info = frame.reference_line_info().front();
+  std::string blocking_obstacle_id =
+      reference_line_info.GetBlockingObstacleId();
+  if (blocking_obstacle_id.empty()) {
+    ADEBUG << "There is no blocking obstacle.";
+    return true;
+  }
+  const Obstacle* blocking_obstacle =
+      reference_line_info.path_decision().obstacles().Find(
+          blocking_obstacle_id);
+  double blocking_obstacle_s =
+      blocking_obstacle->PerceptionSLBoundary().start_s();
+  double adc_frenet_s =
+      reference_line_info.reference_line()
+          .GetFrenetPoint(frame.PlanningStartPoint().path_point())
+          .s();
+  ADEBUG << "Blocking obstacle is at s = " << blocking_obstacle_s;
+  ADEBUG << "ADC is at s = " << adc_frenet_s;
+  ADEBUG << "Destination is within: "
+         << reference_line_info.SDistanceToDestination();
+  if (blocking_obstacle_s - adc_frenet_s >
+      reference_line_info.SDistanceToDestination()) {
+    return false;
+  }
+  return true;
 }
 
 bool SidePassScenario::IsFarFromDestination(const Frame& frame) {
@@ -224,6 +307,24 @@ bool SidePassScenario::IsFarFromIntersection(const Frame& frame) {
     }
   }
   return true;
+}
+
+bool SidePassScenario::IsWithinSidePassingSpeedADC(const Frame& frame) {
+  return frame.PlanningStartPoint().v() < kSidePassMaxSpeed;
+}
+
+// TODO(jiacheng): implement this to replace HasBlockingObstacle.
+bool SidePassScenario::IsSidePassableObstacle(
+    const Frame& frame, const ReferenceLineInfo& reference_line_info,
+    const std::string& blocking_obstacle_id) {
+  const Obstacle* blocking_obstacle =
+      reference_line_info.path_decision().obstacles().Find(
+          blocking_obstacle_id);
+  if (blocking_obstacle == nullptr) {
+    ADEBUG << "Doesn't exist such blocking obstalce.";
+    return true;
+  }
+  return IsNonmovableObstacle(reference_line_info, *blocking_obstacle);
 }
 
 bool SidePassScenario::HasBlockingObstacle(const Frame& frame,
